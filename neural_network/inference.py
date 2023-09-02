@@ -12,6 +12,31 @@ import torch.nn.functional as F
 from PIL import Image
 import cv2
 
+INTRINSICS = np.array([
+            [
+                [455.209, 0.0,     317.772],
+                [0.0    , 454.941, 179.729],
+                [0.0    , 0.0,     1.0    ] # left
+            ],
+            [
+                [455.449, 0.0,     319.373],
+                [0.0    , 454.540, 180.585],
+                [0.0    , 0.0,     1.0    ] # right
+            ]
+        ])
+
+EXTRINSICS = np.array(
+            [[[-0.3506,   -0.6968,    0.6257,  0.4617873],
+              [ 0.9308,   -0.1859,    0.3146,  0.1960991],
+              [-0.1029,    0.6928,    0.7138,  0.4683795],
+              [ 0.    ,    0.    ,    0.    ,  1.        ]], # left
+
+             [[ 0.3849,    0.6775,   -0.6267,   -0.471459 ],
+              [-0.9181,    0.2113,   -0.3354,   -0.1985267],
+              [-0.0948,    0.7045,    0.7033,   0.4687329],
+              [ 0.    ,    0.    ,    0.    ,   1.       ]]] # right
+        ) # hard code
+DEPTH_DIR = '/data/danshili/merged_graspnerf/debug/2023-09-03-03-21-35'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='deeplabv3plus_resnet101', help='Model file name [default: votenet]')
@@ -22,6 +47,7 @@ parser.add_argument('--split', default='test_seen', help='dataset split [default
 parser.add_argument('--camera', default='kinect', help='camera to use [default: kinect]')
 parser.add_argument('--dataset_root', default='/DATA2/Benchmark/graspnet', help='where dataset is')
 parser.add_argument('--save_dir', default='/DATA2/Benchmark/suction/inference_results/deeplabV3plus', help='Dump dir to save model checkpoint [default: log]')
+parser.add_argument('--depth_dir', default='/DATA2/Benchmark/suction/inference_results/deeplabV3plus', help='where to load depth image')
 parser.add_argument('--checkpoint_path', default='checkpoints/checkpoint_30', help='Model checkpoint path [default: None]')
 parser.add_argument('--overwrite', action='store_true', help='Overwrite existing log and dump folders.')
 parser.add_argument('--save_visu', action='store_true', help='whether to save visualizations.')
@@ -31,6 +57,7 @@ FLAGS = parser.parse_args()
 LOG_DIR = FLAGS.log_dir
 CHECKPOINT_PATH = FLAGS.checkpoint_path
 SAVE_PATH = FLAGS.save_dir
+DEPTH_DIR = FLAGS.depth_dir
 split = FLAGS.split
 camera = FLAGS.camera
 dataset_root = FLAGS.dataset_root
@@ -222,6 +249,129 @@ def get_suction_from_heatmap(depth_img, heatmap, camera_info):
 
     return suction_arr, idx0, idx1
 
+def inference_graspnerf(dataset_root):
+    for fp in sorted(os.listdir(dataset_root)):
+        camera_idx = int(fp.split('.')[0].split('_')[-1])
+        time_idx = int(fp.split('_')[0])
+        intrinsics = INTRINSICS[camera_idx]
+        extrinsics = EXTRINSICS[camera_idx]
+
+        fx, fy = intrinsics[0,0], intrinsics[1,1]
+        cx, cy = intrinsics[0,2], intrinsics[1,2]
+        width = 640
+        height = 360
+        #s = 1000.0
+        s=1.0
+        camera_info = CameraInfo(width, height, fx, fy, cx, cy, s)
+
+
+        rgb_file = os.path.join(dataset_root,fp)
+        depth_file = os.path.join(DEPTH_DIR,fp.split(".")[0]+".npz")   #TODO: predict depth image and save
+        
+    
+        rgb = cv2.imread(rgb_file).astype(np.float32) / 255.0
+        rgb = cv2.resize(rgb,(width,height))
+        #depth = cv2.imread(depth_file, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
+        depth = np.load(depth_file)['depth']
+        depth = cv2.resize(depth,(width,height))
+        rgb, depth = torch.from_numpy(rgb), torch.from_numpy(depth)    
+
+        depth = torch.clamp(depth, 0, 1)
+        rgbd = torch.cat([rgb, depth.unsqueeze(-1)], dim=-1).unsqueeze(0)
+        rgbd = rgbd.permute(0, 3, 1, 2)
+        rgbd = rgbd.to(device)
+
+        net.eval()
+        tic = time.time()
+        with torch.no_grad():
+            pred = net(rgbd)
+        pred = pred.clamp(0, 1)
+        toc = time.time()
+        print('inference time:', toc - tic)
+
+        heatmap = (pred[0, 0] * pred[0, 1]).cpu().unsqueeze(0).unsqueeze(0)
+    
+        k_size = 15
+        kernel = uniform_kernel(k_size)
+        kernel = torch.from_numpy(kernel).unsqueeze(0).unsqueeze(0)
+        heatmap = F.conv2d(heatmap, kernel, padding=(kernel.shape[2] // 2, kernel.shape[3] // 2)).squeeze().numpy()
+
+        suctions, idx0, idx1 = get_suction_from_heatmap(depth.numpy(), heatmap, camera_info)
+        # TODO: transform suction normal and position from camera space to world space
+        # Suctions [N,7]: [score, normal*3, coord*3]
+        suctions[:,1:4] = -suctions[:,1:4] @ np.linalg.inv(extrinsics[:3,:3])
+        aug_pos = np.concatenate([suctions[:,4:],np.ones((suctions.shape[0],1))],axis=-1)
+        suctions[:,4:] = (aug_pos @ np.linalg.inv(extrinsics))[:,:3]
+
+    
+        save_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'suction')
+        os.makedirs(save_dir, exist_ok=True)
+        suction_numpy_file = os.path.join(save_dir, 'suction.npz')
+        print('Saving:', suction_numpy_file)
+        np.savez(suction_numpy_file, suctions)
+
+        if FLAGS.save_visu:
+            rgb_img = rgbd[0].permute(1, 2, 0)[..., :3].cpu().numpy()
+            rgb_img *= 255
+            
+            # predictions
+            score = pred[0, 0].clamp(0, 1).cpu().numpy()
+            center = pred[0, 1].clamp(0, 1).cpu().numpy()
+
+            score *= 255
+            center *= 255
+            mix = heatmap * 255
+
+            score_img = cv2.applyColorMap(score.astype(np.uint8), cv2.COLORMAP_RAINBOW)
+            score_img = score_img * 0.5 + rgb_img * 0.5
+            score_img = score_img.astype(np.uint8)
+            score_img = Image.fromarray(score_img)
+
+            center_img = cv2.applyColorMap(center.astype(np.uint8), cv2.COLORMAP_RAINBOW)
+            center_img = center_img * 0.5 + rgb_img * 0.5
+            center_img = center_img.astype(np.uint8)
+            center_img = Image.fromarray(center_img)
+
+            mix_img = cv2.applyColorMap(mix.astype(np.uint8), cv2.COLORMAP_RAINBOW)
+            mix_img = mix_img * 0.5 + rgb_img * 0.5
+            mix_img = mix_img.astype(np.uint8)
+            mix_img = Image.fromarray(mix_img)
+
+            score_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'visu')
+            os.makedirs(score_dir, exist_ok=True)
+            score_file = os.path.join(score_dir, 'smoothness.png')
+            print('saving:', score_file)
+            score_img.save(score_file)
+
+            center_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'visu')
+            os.makedirs(center_dir, exist_ok=True)
+            center_file = os.path.join(center_dir, 'center.png')
+            print('saving:', center_file)
+            center_img.save(center_file)
+
+            mix_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'visu')
+            os.makedirs(mix_dir, exist_ok=True)
+            mix_file = os.path.join(mix_dir, 'mix.png')
+            print('saving:', mix_file)
+            mix_img.save(mix_file)
+
+            # sampled suctions
+            sampled_img = np.zeros_like(heatmap)
+            for i in range(suctions.shape[0]):
+                drawGaussian(sampled_img, [idx1[i], idx0[i]], suctions[i, 0], 3)
+            
+            sampled_img *= 255
+            sampled_img = cv2.applyColorMap(sampled_img.astype(np.uint8), cv2.COLORMAP_RAINBOW)
+            sampled_img = sampled_img * 0.5 + rgb_img * 0.5
+            sampled_img = sampled_img.astype(np.uint8)
+            sampled_img = Image.fromarray(sampled_img)
+            
+            sampled_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'visu')
+            os.makedirs(sampled_dir, exist_ok=True)
+            sampled_file = os.path.join(sampled_dir, 'sampled.png')
+            print('saving:', sampled_file)
+            sampled_img.save(sampled_file) 
+
 def inference_one_view(rgb_file, depth_file, meta_file, scene_idx, anno_idx):
     
     meta = scio.loadmat(meta_file)
@@ -236,6 +386,7 @@ def inference_one_view(rgb_file, depth_file, meta_file, scene_idx, anno_idx):
     rgb = cv2.imread(rgb_file).astype(np.float32) / 255.0
     depth = cv2.imread(depth_file, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
     rgb, depth = torch.from_numpy(rgb), torch.from_numpy(depth)
+    
     
     depth = torch.clamp(depth, 0, 1)
     if FLAGS.model == 'convnet_resnet101':
@@ -347,7 +498,7 @@ def inference(scene_idx):
         inference_one_view(rgb_file, depth_file, meta_file, scene_idx, anno_idx)
 
 if __name__ == "__main__":
-    
+    is_graspnerf = False
     scene_list = []
     if split == 'test':
         for i in range(100, 190):
@@ -361,10 +512,14 @@ if __name__ == "__main__":
     elif split == 'test_novel':
         for i in range(160, 190):
             scene_list.append(i)
+    elif split == 'graspnerf':
+        is_graspnerf = True
+        inference_graspnerf(dataset_root)
     else:
         print('invalid split')
     
-    for scene_idx in scene_list:
-        inference(scene_idx)
+    if not is_graspnerf:
+        for scene_idx in scene_list:
+            inference(scene_idx)
     
 

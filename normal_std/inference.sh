@@ -28,8 +28,8 @@
 # --dataset_root /DATA2/Benchmark/graspnet \
 # --save_visu
 
-python inference.py --split test_novel \
+python inference.py --split test_seen \
 --camera realsense \
---save_root /DATA2/Benchmark/suction/inference_results/normals_std \
---dataset_root /DATA2/Benchmark/graspnet \
+--save_root /data/danshili/suctionnet_out/normal_std \
+--dataset_root /data/danshili/suctionnet_data \
 --save_visu
