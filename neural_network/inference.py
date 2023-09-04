@@ -146,6 +146,27 @@ def create_point_cloud_from_depth_image(depth, camera, organized=True):
         cloud = cloud.reshape([-1, 3])
     return cloud
 
+def create_point_cloud_from_depth_image_intrinsics(depth, camera, intrinsics, organized=True):
+    assert(depth.shape[0] == camera.height and depth.shape[1] == camera.width)
+    xmap = np.arange(camera.width)
+    ymap = np.arange(camera.height)
+    xmap, ymap = np.meshgrid(xmap, ymap)    
+
+    aug_coord = np.concatenate([xmap[:,:,np.newaxis], ymap[:,:,np.newaxis], np.ones((camera.height,camera.width,1))],axis=-1)
+    Ks_inv = np.linalg.inv(intrinsics)
+    cam_xyz = (Ks_inv @ aug_coord[...,np.newaxis])[...,0]
+    directions = cam_xyz
+    cloud = depth[...,np.newaxis] * directions
+    '''
+    points_z = depth
+    points_x = (xmap - camera.cx) * points_z / camera.fx
+    points_y = (ymap - camera.cy) * points_z / camera.fy
+    cloud = np.stack([points_x, points_y, points_z], axis=-1)
+    '''
+    if not organized:
+        cloud = cloud.reshape([-1, 3])
+    return cloud
+
 def grid_sample(pred_score_map, down_rate=20, topk=512):
     num_row = pred_score_map.shape[0] // down_rate
     num_col = pred_score_map.shape[1] // down_rate
@@ -218,6 +239,37 @@ def drawGaussian(img, pt, score, sigma=1):
 
     tmp_img[img_y[0]:img_y[1], img_x[0]:img_x[1]] = g
     img += tmp_img
+ 
+
+def get_suction_from_heatmap_intrinsics(depth_img, heatmap, camera, intrinsics):
+    suction_scores, idx0, idx1 = grid_sample(heatmap, down_rate=10, topk=1024)
+
+    if len(depth_img.shape) == 3:
+        depth_img = depth_img[..., 0]
+    point_cloud = create_point_cloud_from_depth_image_intrinsics(depth_img, camera, intrinsics)
+    
+    suction_points = point_cloud[idx0, idx1, :]
+
+    tic_sub = time.time()
+    
+    point_cloud = point_cloud.reshape(-1, 3)
+    pc_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(point_cloud))
+    pc_voxel_sampled = pc_o3d.voxel_down_sample(0.003)
+    points_sampled = np.array(pc_voxel_sampled.points).astype(np.float32)
+    points_sampled = np.concatenate([suction_points, points_sampled], axis=0)
+    pc_voxel_sampled.points = o3d.utility.Vector3dVector(points_sampled)
+    pc_voxel_sampled.estimate_normals(o3d.geometry.KDTreeSearchParamRadius(0.015), fast_normal_computation=False)
+    pc_voxel_sampled.orient_normals_to_align_with_direction(np.array([0., 0., -1.]))
+    pc_voxel_sampled.normalize_normals()
+    pc_normals = np.array(pc_voxel_sampled.normals).astype(np.float32)
+    suction_normals = pc_normals[:suction_points.shape[0], :]
+
+    toc_sub = time.time()
+    print('estimate normal time:', toc_sub - tic_sub)
+
+    suction_arr = np.concatenate([suction_scores[..., np.newaxis], suction_normals, suction_points], axis=-1)
+
+    return suction_arr, idx0, idx1
 
 def get_suction_from_heatmap(depth_img, heatmap, camera_info):
     suction_scores, idx0, idx1 = grid_sample(heatmap, down_rate=10, topk=1024)
@@ -299,16 +351,35 @@ def inference_graspnerf(dataset_root):
         suctions, idx0, idx1 = get_suction_from_heatmap(depth.numpy(), heatmap, camera_info)
         # TODO: transform suction normal and position from camera space to world space
         # Suctions [N,7]: [score, normal*3, coord*3]
-        suctions[:,1:4] = -suctions[:,1:4] @ np.linalg.inv(extrinsics[:3,:3])
-        aug_pos = np.concatenate([suctions[:,4:],np.ones((suctions.shape[0],1))],axis=-1)
-        suctions[:,4:] = (aug_pos @ np.linalg.inv(extrinsics))[:,:3]
+        suctions_world_coord = suctions.copy()
+        
+        rot = extrinsics[:3,:3]
+        trans = -rot @ extrinsics[:3,3:]
+        suctions_world_coord[:,1:4] = (rot @ suctions_world_coord[:,1:4][...,np.newaxis])[...,0]
+        suctions_world_coord[:,4:] = (rot @ suctions_world_coord[:,4:][...,np.newaxis] + trans)[...,0]
+        suctions_world_coord[:,1:4] = (suctions_world_coord[:,1:4,np.newaxis])[...,0]
+        suctions_world_coord[:,4:] = (suctions_world_coord[:,4:,np.newaxis])[...,0]
+        '''
+        suctions_world_coord[:,1:4] = suctions_world_coord[:,1:4] @ np.linalg.inv(extrinsics[:3,:3])
+        aug_pos = np.concatenate([suctions_world_coord[:,4:],np.ones((suctions_world_coord.shape[0],1))],axis=-1)
+        suctions_world_coord[:,4:] = (aug_pos @ np.linalg.inv(extrinsics))[:,:3]
+        '''
+
+        # filter valid points and select higher candidates
+        valid_idx = (suctions_world_coord[:,6] > 0.03) & (suctions_world_coord[:,6] < 0.30) & (suctions_world_coord[:,4] > 0.0) & (suctions_world_coord[:,4] < 0.5) & (suctions_world_coord[:,5] > -0.2) & (suctions_world_coord[:,5] < 0.2)
+        suctions_world_coord, suctions, idx0, idx1 = suctions_world_coord[valid_idx], suctions[valid_idx], idx0[valid_idx], idx1[valid_idx]
+        score_weighted_height = suctions_world_coord[:,0] * suctions_world_coord[:,6]
+        sorted_idx = np.argsort(score_weighted_height)[::-1]
+        suctions_world_coord = suctions_world_coord[sorted_idx]
+        suctions, idx0, idx1 = suctions[sorted_idx], idx0[sorted_idx], idx1[sorted_idx]
+        
 
     
         save_dir = os.path.join(SAVE_PATH, split, 'scene_%04d_%04d'%(time_idx,camera_idx), camera, 'suction')
         os.makedirs(save_dir, exist_ok=True)
         suction_numpy_file = os.path.join(save_dir, 'suction.npz')
         print('Saving:', suction_numpy_file)
-        np.savez(suction_numpy_file, suctions)
+        np.savez(suction_numpy_file, suctions_world_coord)
 
         if FLAGS.save_visu:
             rgb_img = rgbd[0].permute(1, 2, 0)[..., :3].cpu().numpy()
@@ -358,7 +429,7 @@ def inference_graspnerf(dataset_root):
             # sampled suctions
             sampled_img = np.zeros_like(heatmap)
             for i in range(suctions.shape[0]):
-                drawGaussian(sampled_img, [idx1[i], idx0[i]], suctions[i, 0], 3)
+                drawGaussian(sampled_img, [idx1[i], idx0[i]], 0.2+0.8*suctions[i, 0], 3)
             
             sampled_img *= 255
             sampled_img = cv2.applyColorMap(sampled_img.astype(np.uint8), cv2.COLORMAP_RAINBOW)
